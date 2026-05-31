@@ -15,7 +15,7 @@ export default async function handler(req: Request) {
   try {
     const { profile, stats, recentQuests } = await req.json();
 
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
     if (!apiKey) {
       return new Response(JSON.stringify({ error: 'API key unconfigured on server.' }), { 
         status: 500,
