@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { UserProfile, UserStats, Quest } from '../types';
+import type { UserProfile, UserStats, Quest, WellnessTask, QuestDifficulty } from '../types';
 import type { InventoryItem, SystemLog } from '../types/features';
 import { db } from '../db/database';
 import { calculateRequiredXp, getRankFromLevel, getRankTitle } from '../utils/systemCalculations';
@@ -11,10 +11,13 @@ interface SystemState {
   quests: Quest[];
   inventory: InventoryItem[];
   logs: SystemLog[];
+  wellnessTasks: WellnessTask[];
   isLoading: boolean;
   isPenaltyActive: boolean;
   isInitialized: boolean;
   systemDirective: string;
+  globalDifficulty: QuestDifficulty;
+  trainingFocus: 'BALANCED' | 'STRENGTH' | 'AGILITY' | 'VITALITY';
   
   // Actions
   initialize: () => Promise<void>;
@@ -23,11 +26,15 @@ interface SystemState {
   updateQuestProgress: (questId: string, objectiveId: string, amount: number) => Promise<void>;
   completeQuest: (questId: string) => Promise<void>;
   seedDailyQuest: () => Promise<void>;
+  seedInventory: () => Promise<void>;
   checkPenalty: () => void;
   fetchSystemDirective: () => Promise<void>;
   addLog: (category: SystemLog['category'], message: string, metadata?: SystemLog['metadata']) => Promise<void>;
   addItem: (item: Omit<InventoryItem, 'quantity'>, quantity: number) => Promise<void>;
   useItem: (itemId: string) => Promise<void>;
+  completeWellnessTask: (taskId: string) => Promise<void>;
+  setDifficulty: (difficulty: QuestDifficulty) => void;
+  setTrainingFocus: (focus: 'BALANCED' | 'STRENGTH' | 'AGILITY' | 'VITALITY') => void;
 }
 
 const INITIAL_PROFILE: UserProfile = {
@@ -47,16 +54,25 @@ const INITIAL_STATS: UserStats = {
   sense: 10
 };
 
+const DEFAULT_WELLNESS_TASKS: WellnessTask[] = [
+  { id: 'well-1', title: 'Nutritional Intake (3 Clean Meals)', type: 'PSYCH', rewardXp: 10, isCompleted: false },
+  { id: 'well-2', title: 'Hydration Strategy (3 Liters)', type: 'PHYSICAL', rewardXp: 5, isCompleted: false },
+  { id: 'well-3', title: 'Mind Cleansing (10 Min Focus)', type: 'MENTAL', rewardXp: 5, isCompleted: false }
+];
+
 export const useSystemStore = create<SystemState>((set, get) => ({
   profile: INITIAL_PROFILE,
   stats: INITIAL_STATS,
   quests: [],
   inventory: [],
   logs: [],
+  wellnessTasks: [],
   isLoading: true,
   isPenaltyActive: false,
   isInitialized: false,
   systemDirective: "The System is initializing...",
+  globalDifficulty: 'MEDIUM',
+  trainingFocus: 'BALANCED',
 
   initialize: async () => {
     if (get().isInitialized) return;
@@ -67,8 +83,14 @@ export const useSystemStore = create<SystemState>((set, get) => ({
       const profile = await db.userProfile.get(1);
       const stats = await db.userStats.get(1);
       let quests = await db.quests.toArray();
-      const inventory = await db.inventory.toArray();
+      let inventory = await db.inventory.toArray();
       const logs = await db.systemLogs.orderBy('timestamp').reverse().toArray();
+      let wellnessTasks = await db.wellnessTasks.toArray();
+
+      if (wellnessTasks.length === 0) {
+        await db.wellnessTasks.bulkPut(DEFAULT_WELLNESS_TASKS);
+        wellnessTasks = await db.wellnessTasks.toArray();
+      }
 
       if (profile && stats) {
         console.log('System: Profile found, loading data.');
@@ -76,14 +98,20 @@ export const useSystemStore = create<SystemState>((set, get) => ({
            await get().seedDailyQuest();
            quests = await db.quests.toArray();
         }
-        set({ profile, stats, quests, inventory, logs, isLoading: false, isInitialized: true });
+        if (inventory.length === 0) {
+           await get().seedInventory();
+           inventory = await db.inventory.toArray();
+        }
+        set({ profile, stats, quests, inventory, logs, wellnessTasks, isLoading: false, isInitialized: true, trainingFocus: 'BALANCED' });
       } else {
         console.log('System: No profile found, performing initial setup.');
         await db.userProfile.put({ ...INITIAL_PROFILE, id: 1 });
         await db.userStats.put({ ...INITIAL_STATS, id: 1 });
         await get().seedDailyQuest();
+        await get().seedInventory();
         quests = await db.quests.toArray();
-        set({ profile: INITIAL_PROFILE, stats: INITIAL_STATS, quests, inventory: [], logs: [], isLoading: false, isInitialized: true });
+        inventory = await db.inventory.toArray();
+        set({ profile: INITIAL_PROFILE, stats: INITIAL_STATS, quests, inventory, logs: [], wellnessTasks, isLoading: false, isInitialized: true, trainingFocus: 'BALANCED' });
         await get().addLog('SYSTEM_EVENT', 'System Awakening: Welcome, Hunter.');
       }
       get().checkPenalty();
@@ -122,6 +150,29 @@ export const useSystemStore = create<SystemState>((set, get) => ({
     await db.quests.put(dailyQuest);
   },
 
+  seedInventory: async () => {
+    const initialItems: InventoryItem[] = [
+      {
+        id: 'item_potion_time_01',
+        name: 'Temporal Extension Elixir',
+        rarity: 'RARE',
+        description: 'Bends the flow of time. Consuming this item extends an active mission window by 30 minutes.',
+        isConsumable: true,
+        quantity: 2
+      },
+      {
+        id: 'item_strength_shard_01',
+        name: 'Fragment of a Giant',
+        rarity: 'UNCOMMON',
+        description: 'A glowing shard that resonates with raw power. Permanently increases STR by 1 when consumed.',
+        isConsumable: true,
+        attributeBoost: { strength: 1 },
+        quantity: 1
+      }
+    ];
+    await db.inventory.bulkPut(initialItems);
+  },
+
   addLog: async (category, message, metadata) => {
     const newLog: SystemLog = {
       id: crypto.randomUUID(),
@@ -151,6 +202,21 @@ export const useSystemStore = create<SystemState>((set, get) => ({
     if (!item || item.quantity <= 0) return;
 
     if (item.isConsumable) {
+       // Specialized logic for timer extension potions
+       if (item.id.includes('potion_time')) {
+        const { quests } = get();
+        const activeDaily = quests.find(q => q.type === 'DAILY' && !q.completedAt);
+        if (activeDaily && activeDaily.expiresAt) {
+          const newExpiry = new Date(activeDaily.expiresAt.getTime() + (30 * 60000)); // +30 mins
+          const updatedQuest = { ...activeDaily, expiresAt: newExpiry };
+          await db.quests.put(updatedQuest);
+          set({ quests: quests.map(q => q.id === activeDaily.id ? updatedQuest : q) });
+          await get().addLog('SYSTEM_EVENT', `Used ${item.name}: Mission window expanded by 30m.`);
+        } else {
+          return; // Don't consume if no active daily
+        }
+      }
+
       const updatedItem = { ...item, quantity: item.quantity - 1 };
       if (updatedItem.quantity > 0) {
         await db.inventory.put(updatedItem);
@@ -298,5 +364,31 @@ export const useSystemStore = create<SystemState>((set, get) => ({
     } else {
       set({ isPenaltyActive: false });
     }
+  },
+
+  completeWellnessTask: async (taskId: string) => {
+    const { wellnessTasks } = get();
+    const task = wellnessTasks.find(t => t.id === taskId);
+    if (!task || task.isCompleted) return;
+
+    const updatedTasks = wellnessTasks.map(t => 
+      t.id === taskId ? { ...t, isCompleted: true } : t
+    );
+    
+    await db.wellnessTasks.update(taskId, { isCompleted: true });
+    set({ wellnessTasks: updatedTasks });
+    
+    await get().addXp(task.rewardXp);
+    await get().addLog('SYSTEM_EVENT', `Daily Living Objective Met: ${task.title}`);
+  },
+
+  setDifficulty: (difficulty: QuestDifficulty) => {
+    set({ globalDifficulty: difficulty });
+    get().addLog('SYSTEM_EVENT', `System difficulty re-scaled to: ${difficulty}`);
+  },
+
+  setTrainingFocus: (focus: 'BALANCED' | 'STRENGTH' | 'AGILITY' | 'VITALITY') => {
+    set({ trainingFocus: focus });
+    get().addLog('SYSTEM_EVENT', `Training focus shifted to: ${focus}`);
   }
 }));

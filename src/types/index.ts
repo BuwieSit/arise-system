@@ -17,12 +17,23 @@ export interface UserProfile {
   attributePoints: number;
 }
 
+export type QuestDifficulty = 'EASY' | 'MEDIUM' | 'HARD' | 'BOSS';
+
+export interface WellnessTask {
+  id: string;
+  title: string;
+  type: 'PHYSICAL' | 'MENTAL' | 'PSYCH';
+  rewardXp: number;
+  isCompleted: boolean;
+}
+
 export interface Quest {
   id: string;
   title: string;
   description: string;
-  type: 'DAILY' | 'SIDE' | 'URGENT';
+  type: 'DAILY' | 'SIDE' | 'URGENT' | 'AI_GENERATED';
   rank: HunterRank;
+  difficulty?: QuestDifficulty;
   objectives: QuestObjective[];
   rewards: QuestRewards;
   expiresAt?: Date;
