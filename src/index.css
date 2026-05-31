@@ -1,0 +1,60 @@
+@import "tailwindcss";
+
+@theme {
+  --color-monolith: #040814;
+  --color-shadow-slate: #0B1528;
+  --color-ethereal-blue: #00D2FF;
+  --color-necrotic-purple: #7000FF;
+  --color-system-alert: #FF0055;
+  --color-monolith-text: #E2E8F0;
+  
+  --font-orbitron: "Orbitron", sans-serif;
+  --font-inter: "Inter", sans-serif;
+}
+
+@layer base {
+  body {
+    @apply bg-monolith text-monolith-text font-inter antialiased;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    @apply font-orbitron tracking-widest uppercase;
+  }
+}
+
+@layer components {
+  .glass-panel {
+    @apply bg-shadow-slate/70 backdrop-blur-md border border-ethereal-blue/20 rounded-lg;
+  }
+
+  .neon-glow-blue {
+    @apply shadow-[0_0_15px_rgba(0,210,255,0.4)] border-ethereal-blue/40;
+  }
+
+  .neon-text-blue {
+    @apply text-ethereal-blue drop-shadow-[0_0_8px_rgba(0,210,255,0.6)];
+  }
+
+  .neon-border-blue {
+    @apply border border-ethereal-blue/30 shadow-[0_0_10px_rgba(0,210,255,0.2)];
+  }
+}
+
+/* Custom scrollbar for the system theme */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #040814;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #0B1528;
+  border-radius: 3px;
+  border: 1px solid rgba(0, 210, 255, 0.1);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #00D2FF;
+}
