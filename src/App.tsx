@@ -13,6 +13,8 @@ import { ConfirmationModal } from './components/ConfirmationModal';
 import QuestLogPrograms from './components/QuestLogPrograms';
 import { LandingPage } from './components/LandingPage';
 import { SystemToasts } from './components/SystemToasts';
+import { Auth } from './components/Auth';
+import { useQuery } from '@tanstack/react-query';
 
 type Tab = 'DASHBOARD' | 'QUEST LOG' | 'INVENTORY' | 'LOGS' | 'SETTINGS';
 type QuestSubTab = 'MISSIONS' | 'PROGRAMS';
@@ -29,7 +31,6 @@ export default function App() {
     stats, 
     quests, 
     wellnessTasks,
-    isLoading, 
     systemDirective,
     globalDifficulty,
     trainingFocus,
@@ -37,7 +38,9 @@ export default function App() {
     systemLocked,
     cooldownTasks,
     isInitialized,
+    session,
     initialize, 
+    syncWithCloud,
     updateQuestProgress, 
     completeQuest,
     undoQuestCompletion,
@@ -46,6 +49,17 @@ export default function App() {
     setDifficulty,
     setTrainingFocus
   } = useSystemStore();
+
+  // Integrated TanStack Query Sync
+  const { isLoading: isSyncing } = useQuery({
+    queryKey: ['system-sync', session?.user?.id],
+    queryFn: async () => {
+        await syncWithCloud();
+        return true;
+    },
+    enabled: isInitialized,
+    staleTime: 1000 * 60 * 2, // 2 minutes
+  });
   
   const { requestPermission } = useNotifications();
 
@@ -85,7 +99,8 @@ export default function App() {
     return <SplashScreen onComplete={() => setShowSplash(false)} />;
   }
 
-  if (isLoading) {
+  // Full page loader only during initial cold sync or auth boot
+  if (!isInitialized || (isSyncing && !profile.id && session)) {
     return (
       <div className="min-h-screen bg-monolith flex items-center justify-center">
         <Loader2 className="text-ethereal-blue animate-spin" size={48} />
@@ -104,11 +119,12 @@ export default function App() {
     return now.getTime() - new Date(completedAt).getTime() < 5 * 60000; // 5 mins
   };
 
-  const showLanding = profile.name === 'Hunter' && isInitialized;
+  const showLanding = session && profile.name === 'Hunter' && isInitialized;
 
   return (
     <div className={`min-h-screen bg-monolith text-monolith-text font-inter antialiased selection:bg-ethereal-blue/30 pb-24 ${settings.streamerMode ? 'streamer-filter' : ''} ${systemLocked ? 'pointer-events-none select-none' : ''}`}>
       
+      {!session && isInitialized && <Auth />}
       {showLanding && <LandingPage />}
       <SystemToasts />
       
@@ -259,7 +275,7 @@ export default function App() {
                     ))}
                  </div>
                  <p className="mt-3 text-[7px] text-gray-600 font-mono uppercase text-center tracking-tighter">
-                   // ADJUSTING FOCUS SHIFTS SYSTEM XP ALLOCATION MATRICES
+                   {"//"} ADJUSTING FOCUS SHIFTS SYSTEM XP ALLOCATION MATRICES
                  </p>
               </section>
             </div>

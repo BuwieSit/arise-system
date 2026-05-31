@@ -21,6 +21,7 @@ export interface OnboardingData {
 }
 
 export interface UserProfile {
+  id: string; // Supabase UID
   name: string;
   title: string;
   level: number;
@@ -28,6 +29,13 @@ export interface UserProfile {
   rank: HunterRank;
   attributePoints: number;
   onboarding?: OnboardingData;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface UserSession {
+  user_id: string;
+  email: string;
 }
 
 export type QuestDifficulty = 'EASY' | 'MEDIUM' | 'HARD' | 'BOSS';

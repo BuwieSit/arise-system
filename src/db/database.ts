@@ -3,8 +3,8 @@ import type { UserProfile, UserStats, Quest, WellnessTask, Program } from '../ty
 import type { InventoryItem, SystemLog } from '../types/features';
 
 export class AriseDatabase extends Dexie {
-  userProfile!: Table<UserProfile & { id: number }>;
-  userStats!: Table<UserStats & { id: number }>;
+  userProfile!: Table<UserProfile>;
+  userStats!: Table<UserStats & { id: string }>;
   quests!: Table<Quest>;
   inventory!: Table<InventoryItem>;
   systemLogs!: Table<SystemLog>;
@@ -13,7 +13,7 @@ export class AriseDatabase extends Dexie {
 
   constructor() {
     super('AriseSystemDB');
-    this.version(4).stores({
+    this.version(5).stores({
       userProfile: 'id',
       userStats: 'id',
       quests: 'id, type, rank, expiresAt',

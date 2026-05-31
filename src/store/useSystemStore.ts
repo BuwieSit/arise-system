@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import type { UserProfile, UserStats, Quest, WellnessTask, QuestDifficulty, SystemSettings, Program, OnboardingData } from '../types';
 import type { InventoryItem, SystemLog, SystemToast } from '../types/features';
 import { db } from '../db/database';
+import { supabase } from '../lib/supabase';
 import { calculateRequiredXp, getRankFromLevel, getRankTitle } from '../utils/systemCalculations';
 import { generateSystemDirective } from '../utils/geminiService';
 import { playSystemSFX, type SoundEffect } from '../utils/audioService';
@@ -16,6 +17,7 @@ interface SystemState {
   wellnessTasks: WellnessTask[];
   toasts: SystemToast[];
   settings: SystemSettings;
+  session: any | null;
   isLoading: boolean;
   isPenaltyActive: boolean;
   isInitialized: boolean;
@@ -27,6 +29,8 @@ interface SystemState {
   
   // Actions
   initialize: () => Promise<void>;
+  syncWithCloud: () => Promise<void>;
+  signOut: () => Promise<void>;
   addXp: (amount: number, silent?: boolean) => Promise<void>;
   updateQuestProgress: (questId: string, objectiveId: string, amount: number) => Promise<void>;
   completeQuest: (questId: string) => Promise<void>;
@@ -54,6 +58,7 @@ interface SystemState {
 }
 
 const INITIAL_PROFILE: UserProfile = {
+  id: '',
   name: 'Hunter',
   title: 'Newbie Hunter',
   level: 1,
@@ -93,8 +98,8 @@ const getProgramData = (scalingFactor: number): Program[] => [
     category: 'Physical',
     tasks: [
       { id: 'phys_1', text: `${Math.ceil(15 * scalingFactor)} Minute Steady Jogging`, type: 'agility', completed: false },
-      { id: 'phys_2', text: `${Math.ceil(3)} Sets of ${Math.ceil(10 * scalingFactor)} Bodyweight Squats`, type: 'strength', completed: false },
-      { id: 'phys_3', text: `${Math.ceil(3)} Sets of Maximum Push-up Reps`, type: 'strength', completed: false }
+      { id: 'phys_2', text: `3 Sets of ${Math.ceil(10 * scalingFactor)} Bodyweight Squats`, type: 'strength', completed: false },
+      { id: 'phys_3', text: `3 Sets of Maximum Push-up Reps`, type: 'strength', completed: false }
     ],
     rewards: { xp: 500, stats: { strength: 5, agility: 5, vitality: 3 }, item: 'Gate Key of Restructuring' }
   },
@@ -104,8 +109,8 @@ const getProgramData = (scalingFactor: number): Program[] => [
     difficulty: 'Medium',
     category: 'Physical',
     tasks: [
-      { id: 'phys_4', text: `${Math.ceil(3)} Sets of ${Math.ceil(12 * scalingFactor)} Diamond Push-ups`, type: 'strength', completed: false },
-      { id: 'phys_5', text: `${Math.ceil(3)} Sets of ${Math.ceil(15 * scalingFactor)} Bulgarian Split Squats`, type: 'strength', completed: false },
+      { id: 'phys_4', text: `3 Sets of ${Math.ceil(12 * scalingFactor)} Diamond Push-ups`, type: 'strength', completed: false },
+      { id: 'phys_5', text: `3 Sets of ${Math.ceil(15 * scalingFactor)} Bulgarian Split Squats`, type: 'strength', completed: false },
       { id: 'phys_6', text: `${Math.ceil(2 * scalingFactor)} Minute Plank Hold`, type: 'vitality', completed: false }
     ],
     rewards: { xp: 600, stats: { strength: 6, vitality: 4 }, item: 'Fragment of a Giant' }
@@ -173,6 +178,7 @@ export const useSystemStore = create<SystemState>((set, get) => ({
   wellnessTasks: [],
   toasts: [],
   settings: INITIAL_SETTINGS,
+  session: null,
   isLoading: true,
   isPenaltyActive: false,
   isInitialized: false,
@@ -184,67 +190,63 @@ export const useSystemStore = create<SystemState>((set, get) => ({
 
   initialize: async () => {
     if (get().isInitialized) return;
-    
-    set({ isLoading: true });
-    try {
-      console.log('System: Initializing database...');
-      const profile = await db.userProfile.get(1);
-      const stats = await db.userStats.get(1);
+    supabase.auth.onAuthStateChange((_event, session) => { set({ session, isInitialized: true }); });
+    const { data: { session } } = await supabase.auth.getSession();
+    set({ session, isInitialized: true });
+  },
+
+  syncWithCloud: async () => {
+    const { session } = get();
+    if (!session) {
+      let profile = await db.userProfile.get('local');
+      let stats = await db.userStats.get('local');
       let quests = await db.quests.toArray();
       let inventory = await db.inventory.toArray();
-      const logs = await db.systemLogs.orderBy('timestamp').reverse().toArray();
-      
-      // Ensure default content exists
-      for (const task of DEFAULT_WELLNESS_TASKS) {
-        const exists = await db.wellnessTasks.get(task.id);
-        if (!exists) await db.wellnessTasks.put(task);
-      }
-      let wellnessTasks = await db.wellnessTasks.toArray();
-
-      // Programs are seeded with scaling factor from profile
-      const scalingFactor = profile?.onboarding?.physicalIndex || 1.0;
-      const programsWithScaling = getProgramData(scalingFactor);
-      
-      for (const prog of programsWithScaling) {
-        const exists = await db.programs.get(prog.id);
-        if (!exists) await db.programs.put(prog);
-      }
+      let logs = await db.systemLogs.orderBy('timestamp').reverse().toArray();
+      let wellness = await db.wellnessTasks.toArray();
       let programs = await db.programs.toArray();
 
-      // Load settings from localStorage if available
-      const savedSettings = localStorage.getItem('arise_settings');
-      if (savedSettings) {
-        set({ settings: JSON.parse(savedSettings) });
-      }
-
-      if (profile && stats) {
-        console.log('System: Profile found, loading data.');
-        if (quests.length === 0) {
-           await get().seedDailyQuest();
-           quests = await db.quests.toArray();
-        }
-        if (inventory.length === 0) {
-           await get().seedInventory();
-           inventory = await db.inventory.toArray();
-        }
-        set({ profile, stats, quests, inventory, logs, wellnessTasks, programs, isLoading: false, isInitialized: true, trainingFocus: 'BALANCED' });
-      } else {
-        console.log('System: No profile found, performing initial setup.');
-        await db.userProfile.put({ ...INITIAL_PROFILE, id: 1 });
-        await db.userStats.put({ ...INITIAL_STATS, id: 1 });
-        set({ profile: INITIAL_PROFILE, stats: INITIAL_STATS, quests: [], inventory: [], logs: [], wellnessTasks, programs: [], isLoading: false, isInitialized: true, trainingFocus: 'BALANCED' });
-      }
-      get().checkPenalty();
-      get().fetchSystemDirective();
-    } catch (error) {
-      console.error('System: Failed to initialize:', error);
-      set({ isLoading: false, isInitialized: true });
+      if (wellness.length === 0) { await db.wellnessTasks.bulkPut(DEFAULT_WELLNESS_TASKS); wellness = await db.wellnessTasks.toArray(); }
+      set({ profile: profile || INITIAL_PROFILE, stats: (stats as any) || INITIAL_STATS, quests, inventory, logs, wellnessTasks: wellness, programs, isLoading: false });
+      return;
     }
+
+    try {
+      const { data: pData } = await supabase.from('profiles').select('*').eq('id', session.user.id).maybeSingle();
+      const { data: stats } = await supabase.from('user_stats').select('*').eq('user_id', session.user.id).maybeSingle();
+
+      if (pData && stats) {
+        const profile: UserProfile = { ...pData, attributePoints: (pData as any).attribute_points };
+        const { data: qData } = await supabase.from('quests').select('*').eq('user_id', session.user.id);
+        const { data: iData } = await supabase.from('inventory').select('*').eq('user_id', session.user.id);
+        const { data: logs } = await supabase.from('system_logs').select('*').eq('user_id', session.user.id).order('timestamp', { ascending: false });
+        const { data: wData } = await supabase.from('wellness_tasks').select('*').eq('user_id', session.user.id);
+        const { data: programs } = await supabase.from('programs').select('*').eq('user_id', session.user.id);
+
+        set({ 
+          profile, 
+          stats, 
+          quests: (qData || []).map((q: any) => ({ ...q, taskType: q.task_type, expiresAt: q.expires_at ? new Date(q.expires_at) : undefined, completedAt: q.completed_at ? new Date(q.completed_at) : undefined, isPenalty: q.is_penalty })), 
+          inventory: iData || [], 
+          logs: logs || [], 
+          wellnessTasks: (wData && wData.length > 0) ? wData.map((w: any) => ({ ...w, rewardXp: w.reward_xp, isCompleted: w.is_completed, completedAt: w.completed_at ? new Date(w.completed_at) : undefined })) : DEFAULT_WELLNESS_TASKS, 
+          programs: (programs || []).map((p: any) => ({ ...p, isClaimed: p.is_claimed })), 
+          isLoading: false 
+        });
+        get().checkPenalty();
+        get().fetchSystemDirective();
+      } else {
+        set({ profile: { ...INITIAL_PROFILE, id: session.user.id }, stats: INITIAL_STATS, isLoading: false });
+      }
+    } catch (error) { console.error('Cloud Sync Failed:', error); set({ isLoading: false }); }
   },
 
-  playSound: (sound: SoundEffect) => {
-    playSystemSFX(sound, get().settings.sfxEnabled);
+  signOut: async () => {
+    await supabase.auth.signOut();
+    set({ session: null, profile: INITIAL_PROFILE, stats: INITIAL_STATS, quests: [], inventory: [], logs: [], wellnessTasks: [], programs: [] });
   },
+
+  playSound: (sound: SoundEffect) => { playSystemSFX(sound, get().settings.sfxEnabled); },
 
   fetchSystemDirective: async () => {
     const { profile, stats, quests } = get();
@@ -253,22 +255,12 @@ export const useSystemStore = create<SystemState>((set, get) => ({
   },
 
   seedDailyQuest: async () => {
-    const { globalDifficulty, profile } = get();
+    const { globalDifficulty, profile, session } = get();
     const scalar = globalDifficulty === 'BOSS' ? 3 : globalDifficulty === 'HARD' ? 1.5 : globalDifficulty === 'MEDIUM' ? 1 : 0.5;
     const physicalIndex = profile.onboarding?.physicalIndex || 1.0;
-    
     const combinedScale = scalar * physicalIndex;
 
-    const titles = [
-        'Preparation for Building Power',
-        'Morning Routine of the Awakened',
-        'Structural Reinforcement Protocol',
-        'Foundation of the Monarch',
-        'Shadow Hunter Conditioning',
-        'Legacy of the Great King',
-        'Uprising: Leveling the Playing Field'
-    ];
-
+    const titles = ['Prep for Building Power', 'Shadow Hunter Conditioning', 'Legacy of the Great King', 'Uprising: Leveling the Field'];
     const randomTitle = titles[Math.floor(Math.random() * titles.length)];
 
     const dailyQuest: Quest = {
@@ -285,77 +277,79 @@ export const useSystemStore = create<SystemState>((set, get) => ({
         { id: 'obj-3', task: 'Squats', current: 0, target: Math.ceil(100 * combinedScale) },
         { id: 'obj-4', task: 'Running', current: 0, target: Math.ceil(10 * combinedScale), unit: 'km' }
       ],
-      rewards: {
-        xp: Math.ceil(100 * scalar),
-        attributePoints: globalDifficulty === 'BOSS' ? 10 : Math.ceil(3 * scalar)
-      },
+      rewards: { xp: Math.ceil(100 * scalar), attributePoints: globalDifficulty === 'BOSS' ? 10 : Math.ceil(3 * scalar) },
       expiresAt: new Date(new Date().setHours(new Date().getHours() + 24))
     };
-    await db.quests.put(dailyQuest);
-    const quests = await db.quests.toArray();
-    set({ quests });
+
+    if (session) {
+      await supabase.from('quests').insert({ 
+          ...dailyQuest, 
+          user_id: session.user.id,
+          task_type: dailyQuest.taskType,
+          expires_at: dailyQuest.expiresAt,
+          completed_at: dailyQuest.completedAt
+      });
+    } else { await db.quests.put(dailyQuest); }
+    
+    set(state => ({ quests: [...state.quests, dailyQuest] }));
   },
 
   seedInventory: async () => {
     const initialItems: InventoryItem[] = [
-      {
-        id: 'item_potion_time_01',
-        name: 'Temporal Extension Elixir',
-        rarity: 'RARE',
-        description: 'Bends the flow of time. Consuming this item extends an active mission window by 30 minutes.',
-        isConsumable: true,
-        quantity: 2
-      },
-      {
-        id: 'item_strength_shard_01',
-        name: 'Fragment of a Giant',
-        rarity: 'UNCOMMON',
-        description: 'A glowing shard that resonates with raw power. Permanently increases STR by 1 when consumed.',
-        isConsumable: true,
-        attributeBoost: { strength: 1 },
-        quantity: 1
-      }
+      { id: 'item_potion_time_01', name: 'Temporal Extension Elixir', rarity: 'RARE', description: 'Extends mission window by 30m.', isConsumable: true, quantity: 2 },
+      { id: 'item_strength_shard_01', name: 'Fragment of a Giant', rarity: 'UNCOMMON', description: 'Permanently increases STR by 1.', isConsumable: true, attributeBoost: { strength: 1 }, quantity: 1 }
     ];
-    await db.inventory.bulkPut(initialItems);
-    const inventory = await db.inventory.toArray();
-    set({ inventory });
+    
+    const { session } = get();
+    if (session) { await supabase.from('inventory').insert(initialItems.map(i => ({ ...i, user_id: session.user.id }))); }
+    else { await db.inventory.bulkPut(initialItems); }
+    
+    const inventory = session ? (await supabase.from('inventory').select('*').eq('user_id', session.user.id)).data : await db.inventory.toArray();
+    set({ inventory: inventory || [] });
   },
 
   seedPrograms: async () => {
-    const { profile } = get();
+    const { profile, session } = get();
     const scalingFactor = profile.onboarding?.physicalIndex || 1.0;
     const programsWithScaling = getProgramData(scalingFactor);
-    await db.programs.clear();
-    await db.programs.bulkPut(programsWithScaling);
-    const programs = await db.programs.toArray();
-    set({ programs });
+
+    if (session) {
+        await supabase.from('programs').delete().eq('user_id', session.user.id);
+        await supabase.from('programs').insert(programsWithScaling.map(p => ({ ...p, user_id: session.user.id, is_claimed: p.isClaimed })));
+    } else {
+        await db.programs.clear();
+        await db.programs.bulkPut(programsWithScaling);
+    }
+    
+    const programs = session ? (await supabase.from('programs').select('*').eq('user_id', session.user.id)).data : await db.programs.toArray();
+    set({ programs: programs || [] });
   },
 
   completeOnboarding: async (data: OnboardingData, name: string) => {
-    const profile: UserProfile = {
-      ...INITIAL_PROFILE,
-      name,
-      onboarding: data
-    };
-    await db.userProfile.put({ ...profile, id: 1 });
-    set({ profile });
+    const { session } = get();
+    const profile: any = { id: session?.user.id || '', name, title: 'Newbie Hunter', level: 1, xp: 0, rank: 'E-Rank', attribute_points: 0, onboarding: data };
+
+    if (session) {
+      await supabase.from('profiles').upsert(profile);
+      await supabase.from('user_stats').upsert({ user_id: session.user.id, strength: 10, agility: 10, vitality: 10, intelligence: 10, sense: 10 });
+    } else {
+      await (db.userProfile as any).put({ ...profile, id: 'local', attributePoints: profile.attribute_points });
+      await (db.userStats as any).put({ ...INITIAL_STATS, id: 'local' });
+    }
+
+    set({ profile: { ...INITIAL_PROFILE, ...profile, attributePoints: profile.attribute_points } });
     await get().seedDailyQuest();
     await get().seedInventory();
     await get().seedPrograms();
-    await get().addLog('SYSTEM_EVENT', `Onboarding Complete: Physical Matrix Calibrated for ${name}.`);
-    get().addToast({ type: 'SUCCESS', title: 'System Awakening', message: `Welcome, Hunter ${name}. Matrices calibrated.` });
+    get().addToast({ type: 'SUCCESS', title: 'System Awakening', message: `Welcome, Hunter ${name}.` });
   },
 
   addLog: async (category, message, metadata) => {
-    const newLog: SystemLog = {
-      id: crypto.randomUUID(),
-      timestamp: new Date(),
-      category,
-      message,
-      metadata
-    };
-    await db.systemLogs.put(newLog);
-    set(state => ({ logs: [newLog, ...state.logs].slice(0, 100) }));
+    const { session } = get();
+    const newLog: any = { category, message, metadata, timestamp: new Date() };
+    if (session) { await supabase.from('system_logs').insert({ ...newLog, user_id: session.user.id }); }
+    else { newLog.id = crypto.randomUUID(); await db.systemLogs.put(newLog); }
+    set(state => ({ logs: [{ ...newLog, id: newLog.id || crypto.randomUUID() }, ...state.logs].slice(0, 100) }));
   },
 
   addToast: (toast) => {
@@ -364,629 +358,250 @@ export const useSystemStore = create<SystemState>((set, get) => ({
     setTimeout(() => get().removeToast(id), 5000);
   },
 
-  removeToast: (id) => {
-    set(state => ({ toasts: state.toasts.filter(t => t.id !== id) }));
-  },
+  removeToast: (id) => { set(state => ({ toasts: state.toasts.filter(t => t.id !== id) })); },
 
   addItem: async (item, quantity) => {
-    const existing = await db.inventory.get(item.id);
-    const updatedItem = existing 
-      ? { ...existing, quantity: existing.quantity + quantity }
-      : { ...item, quantity };
-    
-    await db.inventory.put(updatedItem);
-    const inventory = await db.inventory.toArray();
-    set({ inventory });
-    await get().addLog('SYSTEM_EVENT', `Acquired Item: ${item.name} x${quantity}`);
-    get().addToast({ type: 'SUCCESS', title: 'Item Acquired', message: `${item.name} added to inventory.` });
+    const { session, inventory } = get();
+    const existing = inventory.find(i => i.id === item.id);
+    const updatedItem = existing ? { ...existing, quantity: existing.quantity + quantity } : { ...item, quantity };
+    if (session) { await supabase.from('inventory').upsert({ ...updatedItem, user_id: session.user.id }); }
+    else { await db.inventory.put(updatedItem); }
+    set(state => ({ inventory: state.inventory.map(i => i.id === item.id ? updatedItem : i).concat(existing ? [] : [updatedItem]) }));
+    get().addToast({ type: 'SUCCESS', title: 'Item Acquired', message: item.name });
   },
 
   useItem: async (itemId) => {
-    const item = await db.inventory.get(itemId);
+    const { session, inventory, stats, quests } = get();
+    const item = inventory.find(i => i.id === itemId);
     if (!item || item.quantity <= 0) return;
 
     if (item.isConsumable) {
        get().playSound('sfx_ui_click.mp3');
-       
-       // Specialized logic for timer extension potions
        if (item.id.includes('potion_time') || item.id.includes('chronos')) {
-        const { quests } = get();
         const activeDaily = quests.find(q => q.type === 'DAILY' && !q.completedAt);
         if (activeDaily && activeDaily.expiresAt) {
-          const newExpiry = new Date(activeDaily.expiresAt.getTime() + (30 * 60000)); // +30 mins
-          const updatedQuest = { ...activeDaily, expiresAt: newExpiry };
-          await db.quests.put(updatedQuest);
-          set({ quests: quests.map(q => q.id === activeDaily.id ? updatedQuest : q) });
-          await get().addLog('SYSTEM_EVENT', `Used ${item.name}: Mission window expanded by 30m.`);
-          get().addToast({ type: 'INFO', title: 'Time Dilated', message: 'Mission window expanded by 30 minutes.' });
-        } else {
-          return; // Don't consume if no active daily
-        }
+          const newExpiry = new Date(activeDaily.expiresAt.getTime() + (30 * 60000));
+          if (session) await supabase.from('quests').update({ expires_at: newExpiry }).eq('id', activeDaily.id);
+          else await db.quests.update(activeDaily.id, { expiresAt: newExpiry });
+          set(state => ({ quests: state.quests.map(q => q.id === activeDaily.id ? { ...q, expiresAt: newExpiry } : q) }));
+        } else return;
       }
 
-      // Gate Key of Restructuring: Rerolls daily quests
-      if (item.id.includes('gate_key_refresh') || item.id.includes('Gate Key')) {
-        await db.quests.clear();
-        await get().seedDailyQuest();
-        await get().addLog('SYSTEM_EVENT', `Used ${item.name}: Active missions restructured.`);
-        get().addToast({ type: 'INFO', title: 'Reality Shift', message: 'Active missions have been restructured.' });
-        await get().fetchSystemDirective();
-      }
-
-      // Vigor Restoration Brew: Resets failed tasks (if penalty wasn't triggered yet)
-      if (item.id.includes('vigor_potion') || item.id.includes('Vigor Restoration')) {
-        const { quests } = get();
-        const activeDaily = quests.find(q => q.type === 'DAILY' && !q.completedAt);
-        if (activeDaily) {
-            if (get().isPenaltyActive) {
-                set({ isPenaltyActive: false });
-                const newExpiry = new Date(new Date().setHours(new Date().getHours() + 2));
-                const updatedQuest = { ...activeDaily, expiresAt: newExpiry };
-                await db.quests.put(updatedQuest);
-                set({ quests: quests.map(q => q.id === activeDaily.id ? updatedQuest : q) });
-                await get().addLog('ACHIEVEMENT', `Used ${item.name}: Penalty Zone bypassed. 2h extension granted.`);
-                get().addToast({ type: 'SUCCESS', title: 'Vitality Surge', message: 'Penalty bypassed. 2h extension granted.' });
-            } else {
-                await get().addLog('SYSTEM_EVENT', `Used ${item.name}: Vitality surged.`);
-                get().addToast({ type: 'INFO', title: 'Vitality Surge', message: 'Core energy restored.' });
-            }
-        }
-      }
-
-      const updatedItem = { ...item, quantity: item.quantity - 1 };
-      if (updatedItem.quantity > 0) {
-        await db.inventory.put(updatedItem);
+      const updatedQty = item.quantity - 1;
+      if (session) {
+        if (updatedQty > 0) await supabase.from('inventory').update({ quantity: updatedQty }).match({ id: itemId, user_id: session.user.id });
+        else await supabase.from('inventory').delete().match({ id: itemId, user_id: session.user.id });
       } else {
-        await db.inventory.delete(itemId);
+        if (updatedQty > 0) await db.inventory.update(itemId, { quantity: updatedQty });
+        else await db.inventory.delete(itemId);
       }
       
-      // Apply boosts if any
       if (item.attributeBoost) {
-        const { stats } = get();
-        const updatedStats = {
-          strength: stats.strength + (item.attributeBoost.strength || 0),
-          agility: stats.agility + (item.attributeBoost.agility || 0),
-          vitality: stats.vitality + (item.attributeBoost.vitality || 0),
-          intelligence: stats.intelligence + (item.attributeBoost.intelligence || 0),
-          sense: stats.sense + (item.attributeBoost.sense || 0),
-        };
-        await db.userStats.update(1, updatedStats);
+        const updatedStats = { strength: stats.strength + (item.attributeBoost.strength || 0), agility: stats.agility + (item.attributeBoost.agility || 0), vitality: stats.vitality + (item.attributeBoost.vitality || 0), intelligence: stats.intelligence + (item.attributeBoost.intelligence || 0), sense: stats.sense + (item.attributeBoost.sense || 0) };
+        if (session) await supabase.from('user_stats').update(updatedStats).eq('user_id', session.user.id);
+        else await db.userStats.update(1, updatedStats);
         set({ stats: updatedStats });
-        get().addToast({ 
-            type: 'LEVEL_UP', 
-            title: 'Attribute Enhanced', 
-            message: `Consumed ${item.name}.`,
-            stats: item.attributeBoost
-        });
       }
-
-      const inventory = await db.inventory.toArray();
-      set({ inventory });
-      await get().addLog('SYSTEM_EVENT', `Consumed Item: ${item.name}`);
+      set(state => ({ inventory: updatedQty > 0 ? state.inventory.map(i => i.id === itemId ? { ...i, quantity: updatedQty } : i) : state.inventory.filter(i => i.id !== itemId) }));
     }
   },
 
-  addXp: async (amount: number, silent: boolean = false) => {
-    const { profile } = get();
+  addXp: async (amount, silent = false) => {
+    const { profile, session } = get();
     let newXp = profile.xp + amount;
     let newLevel = profile.level;
     let newAttributePoints = profile.attributePoints;
     let leveledUp = false;
 
-    // Handle potential negative XP (undo)
-    if (newXp < 0) {
-        if (newLevel > 1) {
-            newLevel--;
-            newXp = calculateRequiredXp(newLevel) + newXp;
-            newAttributePoints = Math.max(0, newAttributePoints - 3);
-        } else {
-            newXp = 0;
-        }
-    }
-
-    while (newXp >= calculateRequiredXp(newLevel)) {
-      newXp -= calculateRequiredXp(newLevel);
-      newLevel++;
-      newAttributePoints += 3;
-      leveledUp = true;
-    }
-
+    while (newXp >= calculateRequiredXp(newLevel)) { newXp -= calculateRequiredXp(newLevel); newLevel++; newAttributePoints += 3; leveledUp = true; }
     const newRank = getRankFromLevel(newLevel);
-    const newTitle = profile.level !== newLevel ? getRankTitle(newRank) : profile.title;
+    const updatedProfile = { ...profile, xp: newXp, level: newLevel, rank: newRank, title: getRankTitle(newRank), attributePoints: newAttributePoints };
 
-    const updatedProfile = {
-      ...profile,
-      xp: newXp,
-      level: newLevel,
-      rank: newRank,
-      title: newTitle,
-      attributePoints: newAttributePoints
-    };
-
-    await db.userProfile.update(1, updatedProfile);
-    set({ profile: updatedProfile });
+    if (session) {
+        await supabase.from('profiles').update({ xp: newXp, level: newLevel, rank: newRank, title: updatedProfile.title, attribute_points: newAttributePoints }).eq('id', session.user.id);
+    } else { await (db.userProfile as any).update('local', updatedProfile); }
     
-    if (leveledUp && !silent) {
-      get().playSound('sfx_level_up.mp3');
-      await get().addLog('ACHIEVEMENT', `Level Up! Reached Level ${newLevel}. +3 Attribute Points awarded.`, { levelUp: newLevel });
-      get().addToast({ type: 'LEVEL_UP', title: 'Rank Progression', message: `Leveled up to ${newLevel}!`, stats: { xp: amount, attributePoints: 3 } });
-      get().fetchSystemDirective();
-    }
+    set({ profile: updatedProfile });
+    if (leveledUp && !silent) { get().playSound('sfx_level_up.mp3'); get().addToast({ type: 'LEVEL_UP', title: 'Rank Progression', message: `Leveled up to ${newLevel}!`, stats: { xp: amount, attributePoints: 3 } }); }
   },
 
-  updateQuestProgress: async (questId: string, objectiveId: string, amount: number) => {
-    const { quests } = get();
+  updateQuestProgress: async (questId, objectiveId, amount) => {
+    const { quests, session, systemLocked } = get();
+    if (systemLocked) return;
+    const now = Date.now();
+    if (now - lastClickTime < 800) clickCount++; else clickCount = 1;
+    lastClickTime = now;
+    if (clickCount > 5) {
+      set({ systemLocked: true }); get().playSound('sfx_warning_alert.mp3');
+      setTimeout(() => set({ systemLocked: false, clickCount: 0 } as any), 20000);
+      return;
+    }
+
     const updatedQuests = quests.map(q => {
       if (q.id === questId) {
-        const updatedObjectives = q.objectives.map(obj => {
-          if (obj.id === objectiveId) {
-            return { ...obj, current: Math.min(obj.current + amount, obj.target) };
-          }
-          return obj;
-        });
-        return { ...q, objectives: updatedObjectives };
+        const objectives = q.objectives.map(obj => obj.id === objectiveId ? { ...obj, current: Math.min(obj.current + amount, obj.target) } : obj);
+        return { ...q, objectives };
       }
       return q;
     });
 
-    const targetQuest = updatedQuests.find(q => q.id === questId);
-    if (targetQuest) {
-      await db.quests.put(targetQuest);
+    const target = updatedQuests.find(q => q.id === questId);
+    if (target) {
+      if (session) await supabase.from('quests').update({ objectives: target.objectives }).eq('id', questId);
+      else await db.quests.put(target);
     }
     set({ quests: updatedQuests });
   },
 
-  completeQuest: async (questId: string) => {
-    const { quests, stats, systemLocked } = get();
+  completeQuest: async (questId) => {
+    const { quests, stats, session, systemLocked } = get();
     if (systemLocked) return;
-
     const quest = quests.find(q => q.id === questId);
-    if (!quest || quest.completedAt) return;
+    if (!quest || quest.completedAt || !quest.objectives.every(obj => obj.current >= obj.target)) return;
 
-    const allObjectivesMet = quest.objectives.every(obj => obj.current >= obj.target);
-    if (!allObjectivesMet) return;
+    const completedAt = new Date();
+    if (session) await supabase.from('quests').update({ completed_at: completedAt }).eq('id', questId);
+    else await db.quests.put({ ...quest, completedAt });
 
-    get().playSound('sfx_quest_complete.mp3');
-    const updatedQuest = { ...quest, completedAt: new Date() };
-    await db.quests.put(updatedQuest);
-    
-    await get().addLog('QUEST_LOG', `Quest Cleared: ${quest.title}`);
-    
-    // Automated Attribute Allocation
     const difficultyScalar = quest.difficulty === 'BOSS' ? 3 : quest.difficulty === 'HARD' ? 1.5 : quest.difficulty === 'MEDIUM' ? 1 : 0.5;
     const baseGain = Math.ceil(1 * difficultyScalar);
-    
-    let updatedStats = { ...stats };
-    let gains: Partial<UserStats> = {};
+    let gains: any = { strength: 0, agility: 0, vitality: 0, intelligence: 0, sense: 0 };
+    if (quest.taskType === 'AGI_FOCUS') { gains.agility = Math.ceil(baseGain * 0.7); gains.vitality = Math.ceil(baseGain * 0.3); }
+    else if (quest.taskType === 'STR_FOCUS') { gains.strength = Math.ceil(baseGain * 0.7); gains.vitality = Math.ceil(baseGain * 0.3); }
+    else { gains.strength = Math.ceil(baseGain * 0.2); gains.agility = Math.ceil(baseGain * 0.2); gains.vitality = Math.ceil(baseGain * 0.2); gains.intelligence = Math.ceil(baseGain * 0.2); gains.sense = Math.ceil(baseGain * 0.2); }
 
-    if (quest.taskType === 'AGI_FOCUS') {
-      gains.agility = Math.ceil(baseGain * 0.7);
-      gains.vitality = Math.ceil(baseGain * 0.3);
-    } else if (quest.taskType === 'STR_FOCUS') {
-      gains.strength = Math.ceil(baseGain * 0.7);
-      gains.vitality = Math.ceil(baseGain * 0.3);
-    } else if (quest.taskType === 'INT_FOCUS') {
-      gains.intelligence = Math.ceil(baseGain * 0.7);
-      gains.sense = Math.ceil(baseGain * 0.3);
-    } else if (quest.taskType === 'VIT_FOCUS') {
-      gains.vitality = Math.ceil(baseGain * 0.7);
-      gains.intelligence = Math.ceil(baseGain * 0.3);
-    } else {
-        // Balanced
-        gains.strength = Math.ceil(baseGain * 0.2);
-        gains.agility = Math.ceil(baseGain * 0.2);
-        gains.vitality = Math.ceil(baseGain * 0.2);
-        gains.intelligence = Math.ceil(baseGain * 0.2);
-        gains.sense = Math.ceil(baseGain * 0.2);
-    }
+    const updatedStats = { ...stats };
+    Object.entries(gains).forEach(([k, v]) => updatedStats[k as keyof UserStats] += v as number);
+    if (session) await supabase.from('user_stats').update(updatedStats).eq('user_id', session.user.id);
+    else await db.userStats.update(1, updatedStats);
 
-    Object.entries(gains).forEach(([k, v]) => {
-        updatedStats[k as keyof UserStats] += v;
-    });
-
-    await db.userStats.update(1, updatedStats);
-    set({ stats: updatedStats });
-
-    // Add rewards
+    set({ stats: updatedStats, quests: quests.map(q => q.id === questId ? { ...q, completedAt } : q) });
     await get().addXp(quest.rewards.xp);
-    if (quest.rewards.attributePoints) {
-       const { profile } = get();
-       const updatedProfile = { ...profile, attributePoints: profile.attributePoints + quest.rewards.attributePoints };
-       await db.userProfile.update(1, updatedProfile);
-       set({ profile: updatedProfile });
-    }
-
-    get().addToast({ 
-        type: 'SUCCESS', 
-        title: 'Mission Cleared', 
-        message: `"${quest.title}" synchronization complete.`,
-        stats: { ...gains, xp: quest.rewards.xp, attributePoints: quest.rewards.attributePoints }
-    });
-
-    set({ quests: quests.map(q => q.id === questId ? updatedQuest : q) });
-    
-    // CRITICAL MISSION LOOP: Seed new quest if DAILY
-    if (quest.type === 'DAILY') {
-        setTimeout(async () => {
-            await get().seedDailyQuest();
-            get().addToast({ type: 'INFO', title: 'New Mission Ready', message: 'A secondary mission set has been initialized.' });
-        }, 1000);
-    }
-
-    get().checkPenalty();
-    get().fetchSystemDirective();
+    get().addToast({ type: 'SUCCESS', title: 'Mission Cleared', message: quest.title, stats: { ...gains, xp: quest.rewards.xp } });
+    if (quest.type === 'DAILY') setTimeout(() => get().seedDailyQuest(), 1000);
   },
 
-  undoQuestCompletion: async (questId: string) => {
-    const { quests } = get();
+  undoQuestCompletion: async (questId) => {
+    const { quests, session } = get();
     const quest = quests.find(q => q.id === questId);
-    if (!quest || !quest.completedAt) return;
-
-    // 5 minute grace window
-    const now = new Date();
-    const completionTime = new Date(quest.completedAt);
-    if (now.getTime() - completionTime.getTime() > 5 * 60000) {
-        console.warn('System: Undo window closed for this quest.');
-        return;
-    }
-
-    const updatedQuest = { ...quest, completedAt: undefined };
-    await db.quests.put(updatedQuest);
-    
-    // Deduct XP (silent to avoid level up sound)
+    if (!quest || !quest.completedAt || Date.now() - new Date(quest.completedAt).getTime() > 300000) return;
+    if (session) await supabase.from('quests').update({ completed_at: null }).eq('id', questId);
+    else await db.quests.put({ ...quest, completedAt: undefined });
+    set({ quests: quests.map(q => q.id === questId ? { ...q, completedAt: undefined } : q) });
     await get().addXp(-quest.rewards.xp, true);
-    
-    if (quest.rewards.attributePoints) {
-        const { profile } = get();
-        const updatedProfile = { ...profile, attributePoints: Math.max(0, profile.attributePoints - quest.rewards.attributePoints) };
-        await db.userProfile.update(1, updatedProfile);
-        set({ profile: updatedProfile });
-    }
-
-    set({ quests: quests.map(q => q.id === questId ? updatedQuest : q) });
-    await get().addLog('SYSTEM_EVENT', `Undo Action: Quest "${quest.title}" restored to active state.`);
-    get().addToast({ type: 'WARNING', title: 'Sync Rolled Back', message: `Mission "${quest.title}" restored to active status.` });
   },
 
   checkPenalty: () => {
     const { quests } = get();
-    const dailyQuest = quests.find(q => q.type === 'DAILY');
-    if (dailyQuest && !dailyQuest.completedAt && dailyQuest.expiresAt) {
-      const now = new Date();
-      if (now > dailyQuest.expiresAt) {
-        if (!get().isPenaltyActive) {
-          get().playSound('sfx_warning_alert.mp3');
-          get().addLog('PENALTY', 'The Daily Quest was not completed. Penalty Zone activated.');
-          get().addToast({ type: 'ERROR', title: 'Penalty Incurred', message: 'Mission failed. Core matrix corrupted.' });
-        }
-        set({ isPenaltyActive: true });
-      } else {
-        set({ isPenaltyActive: false });
-      }
-    } else {
-      set({ isPenaltyActive: false });
-    }
+    const daily = quests.find(q => q.type === 'DAILY' && !q.completedAt);
+    if (daily && daily.expiresAt && new Date() > new Date(daily.expiresAt)) {
+      if (!get().isPenaltyActive) { set({ isPenaltyActive: true }); get().addToast({ type: 'ERROR', title: 'Penalty Incurred', message: 'Mission failed.' }); }
+    } else set({ isPenaltyActive: false });
   },
 
-  completeWellnessTask: async (taskId: string) => {
-    const { wellnessTasks, stats, systemLocked, cooldownTasks } = get();
-    
-    if (systemLocked) return;
-    
-    // ANTI-SPAM velocity loop (Harder threshold)
+  completeWellnessTask: async (taskId) => {
+    const { wellnessTasks, session, systemLocked, cooldownTasks } = get();
+    if (systemLocked || cooldownTasks[taskId]) return;
     const now = Date.now();
-    const timeDelta = now - lastClickTime;
-    if (timeDelta < 1500) {
-      clickCount += 1;
-    } else {
-      clickCount = 1;
-    }
+    if (now - lastClickTime < 1500) clickCount++; else clickCount = 1;
     lastClickTime = now;
-
-    if (clickCount > 2) {
-      set({ systemLocked: true });
-      get().playSound('sfx_warning_alert.mp3');
-      get().addLog('PENALTY', 'Anomalous interaction pattern detected. Core matrix sync suspended temporarily.');
-      get().addToast({ type: 'ERROR', title: 'Sync Suspended', message: 'Spam detected. System locked for 20 seconds.' });
-      setTimeout(() => {
-        set({ systemLocked: false });
-        clickCount = 0;
-      }, 20000);
-      return;
-    }
-
-    if (cooldownTasks[taskId]) return;
+    if (clickCount > 2) { set({ systemLocked: true }); setTimeout(() => set({ systemLocked: false, clickCount: 0 } as any), 20000); return; }
 
     const task = wellnessTasks.find(t => t.id === taskId);
     if (!task || task.isCompleted) return;
 
-    // Cooldown Buffer
-    set(state => ({ cooldownTasks: { ...state.cooldownTasks, [taskId]: true } }));
-    setTimeout(() => {
-      set(state => ({ cooldownTasks: { ...state.cooldownTasks, [taskId]: false } }));
-    }, 10000);
+    set(s => ({ cooldownTasks: { ...s.cooldownTasks, [taskId]: true } }));
+    setTimeout(() => set(s => ({ cooldownTasks: { ...s.cooldownTasks, [taskId]: false } })), 10000);
 
-    get().playSound('sfx_quest_complete.mp3');
-    const updatedTasks = wellnessTasks.map(t => 
-      t.id === taskId ? { ...t, isCompleted: true, completedAt: new Date() } : t
-    );
+    const completedAt = new Date();
+    if (session) await supabase.from('wellness_tasks').update({ is_completed: true, completed_at: completedAt }).match({ id: taskId, user_id: session.user.id });
+    else await db.wellnessTasks.update(taskId, { isCompleted: true, completedAt });
+
+    let gain: any = { vitality: 0, intelligence: 0, sense: 0 };
+    if (task.type === 'PHYSICAL') gain.vitality = 1; else if (task.type === 'MENTAL') gain.intelligence = 1; else gain.sense = 1;
+    const updatedStats = { ...get().stats };
+    Object.entries(gain).forEach(([k, v]) => updatedStats[k as keyof UserStats] += v as number);
     
-    await db.wellnessTasks.update(taskId, { isCompleted: true, completedAt: new Date() });
-    set({ wellnessTasks: updatedTasks });
-    
-    // Automated Stat Gains for Wellness
-    let updatedStats = { ...stats };
-    let gain: Partial<UserStats> = {};
-    if (task.type === 'PHYSICAL') gain.vitality = 1;
-    if (task.type === 'MENTAL') gain.intelligence = 1;
-    if (task.type === 'PSYCH') gain.sense = 1;
+    if (session) await supabase.from('user_stats').update(updatedStats).eq('user_id', session.user.id);
+    else await db.userStats.update(1, updatedStats);
 
-    Object.entries(gain).forEach(([k, v]) => {
-        updatedStats[k as keyof UserStats] += v;
-    });
-
-    await db.userStats.update(1, updatedStats);
-    set({ stats: updatedStats });
-
+    set({ stats: updatedStats, wellnessTasks: wellnessTasks.map(t => t.id === taskId ? { ...t, isCompleted: true, completedAt } : t) });
     await get().addXp(task.rewardXp);
-    await get().addLog('SYSTEM_EVENT', `Objective Met: ${task.title}. Attributes adjusted.`);
-    get().addToast({ 
-        type: 'SUCCESS', 
-        title: 'Task Synchronized', 
-        message: task.title,
-        stats: { ...gain, xp: task.rewardXp }
-    });
+    get().addToast({ type: 'SUCCESS', title: 'Task Synced', message: task.title, stats: { ...gain, xp: task.rewardXp } });
   },
 
-  undoWellnessTask: async (taskId: string) => {
-    const { wellnessTasks, stats, systemLocked, cooldownTasks } = get();
-    
-    if (systemLocked) return;
-
-    if (cooldownTasks[taskId]) return;
-
+  undoWellnessTask: async (taskId) => {
+    const { wellnessTasks, session } = get();
     const task = wellnessTasks.find(t => t.id === taskId);
-    if (!task || !task.isCompleted || !task.completedAt) return;
-
-    const now = new Date();
-    if (now.getTime() - new Date(task.completedAt).getTime() > 5 * 60000) return;
-
-    // Cooldown Buffer
-    set(state => ({ cooldownTasks: { ...state.cooldownTasks, [taskId]: true } }));
-    setTimeout(() => {
-      set(state => ({ cooldownTasks: { ...state.cooldownTasks, [taskId]: false } }));
-    }, 10000);
-
-    const updatedTasks = wellnessTasks.map(t => 
-      t.id === taskId ? { ...t, isCompleted: false, completedAt: undefined } : t
-    );
-    
-    await db.wellnessTasks.update(taskId, { isCompleted: false, completedAt: undefined });
-    set({ wellnessTasks: updatedTasks });
-    
-    // Deduct Stats
-    let updatedStats = { ...stats };
-    let loss: Partial<UserStats> = {};
-    if (task.type === 'PHYSICAL') loss.vitality = -1;
-    if (task.type === 'MENTAL') loss.intelligence = -1;
-    if (task.type === 'PSYCH') loss.sense = -1;
-
-    Object.entries(loss).forEach(([k, v]) => {
-        updatedStats[k as keyof UserStats] = Math.max(10, updatedStats[k as keyof UserStats] + v);
-    });
-
-    await db.userStats.update(1, updatedStats);
-    set({ stats: updatedStats });
-
+    if (!task || !task.isCompleted || !task.completedAt || Date.now() - new Date(task.completedAt).getTime() > 300000) return;
+    if (session) await supabase.from('wellness_tasks').update({ is_completed: false, completed_at: null }).match({ id: taskId, user_id: session.user.id });
+    else await db.wellnessTasks.update(taskId, { isCompleted: false, completedAt: undefined });
+    set({ wellnessTasks: wellnessTasks.map(t => t.id === taskId ? { ...t, isCompleted: false, completedAt: undefined } : t) });
     await get().addXp(-task.rewardXp, true);
-    await get().addLog('SYSTEM_EVENT', `Undo Action: Objective "${task.title}" restored.`);
-    get().addToast({ type: 'WARNING', title: 'Task Reversed', message: `Objective "${task.title}" reverted.` });
   },
 
-  toggleProgramTask: async (programId: string, taskId: string) => {
-    const { programs, systemLocked, cooldownTasks, stats } = get();
-    
-    if (systemLocked) return;
-    
-    // Anti-Spam Velocity Loop
-    const now = Date.now();
-    const timeDelta = now - lastClickTime;
-    if (timeDelta < 1500) {
-      clickCount += 1;
-    } else {
-      clickCount = 1;
-    }
-    lastClickTime = now;
-
-    if (clickCount > 2) {
-      set({ systemLocked: true });
-      get().playSound('sfx_warning_alert.mp3');
-      get().addLog('PENALTY', 'Anomalous interaction pattern detected. Core matrix sync suspended temporarily.');
-      get().addToast({ type: 'ERROR', title: 'System Lockdown', message: 'Anomalous interaction detected. Sync suspended for 20s.' });
-      setTimeout(() => {
-        set({ systemLocked: false });
-        clickCount = 0;
-      }, 20000);
-      return;
-    }
-
-    if (cooldownTasks[taskId]) return;
-
-    // Cooldown Buffer
-    set(state => ({ cooldownTasks: { ...state.cooldownTasks, [taskId]: true } }));
-    setTimeout(() => {
-      set(state => ({ cooldownTasks: { ...state.cooldownTasks, [taskId]: false } }));
-    }, 10000);
-
+  toggleProgramTask: async (programId, taskId) => {
+    const { programs, stats, session, systemLocked, cooldownTasks } = get();
+    if (systemLocked || cooldownTasks[taskId]) return;
     const program = programs.find(p => p.id === programId);
-    if (!program) return;
-
-    const task = program.tasks.find(t => t.id === taskId);
+    const task = program?.tasks.find(t => t.id === taskId);
     if (!task) return;
 
     const isChecking = !task.completed;
-    
-    const updatedPrograms = programs.map(p => {
-      if (p.id === programId) {
-        return {
-          ...p,
-          tasks: p.tasks.map(t => t.id === taskId ? { ...t, completed: isChecking, completedAt: isChecking ? new Date() : undefined } : t)
-        };
-      }
-      return p;
-    });
+    const updatedTasks = program!.tasks.map(t => t.id === taskId ? { ...t, completed: isChecking, completedAt: isChecking ? new Date() : undefined } : t);
+    if (session) await supabase.from('programs').update({ tasks: updatedTasks }).match({ id: programId, user_id: session.user.id });
+    else await db.programs.update(programId, { tasks: updatedTasks });
 
-    await db.programs.put(updatedPrograms.find(p => p.id === programId)!);
-    set({ programs: updatedPrograms });
-
-    let updatedStats = { ...stats };
-    let gain: Partial<UserStats> = {};
+    set({ programs: programs.map(p => p.id === programId ? { ...p, tasks: updatedTasks } : p) });
     if (isChecking) {
-      get().playSound('sfx_ui_click.mp3');
-      gain[task.type] = 1;
-      updatedStats[task.type] += 1;
+      const updatedStats = { ...stats, [task.type]: stats[task.type] + 1 };
+      if (session) await supabase.from('user_stats').update(updatedStats).eq('user_id', session.user.id);
+      else await db.userStats.update(1, updatedStats);
+      set({ stats: updatedStats });
       await get().addXp(15);
-      
-      get().addToast({ type: 'SUCCESS', title: 'Program Objective', message: `Syncing ${task.text}...`, stats: { ...gain, xp: 15 } });
-
-      // Random item drop
-      if (Math.random() > 0.8) {
-          await get().addItem({
-            id: 'item_vigor_potion',
-            name: 'Vigor Restoration Brew',
-            rarity: 'COMMON',
-            description: 'A bitter brew that restores physical energy.',
-            isConsumable: true,
-          }, 1);
-      }
-    } else {
-      // Undo Protocol
-      gain[task.type] = -1;
-      updatedStats[task.type] = Math.max(10, updatedStats[task.type] - 1);
-      await get().addXp(-15, true);
-      get().addToast({ type: 'WARNING', title: 'Objective Reverted', message: 'Attribute gain rolled back.' });
+      get().addToast({ type: 'SUCCESS', title: 'Objective Synced', stats: { [task.type]: 1, xp: 15 } } as any);
     }
-
-    await db.userStats.update(1, updatedStats);
-    set({ stats: updatedStats });
   },
 
-  claimProgramRewards: async (programId: string) => {
-    const { programs, stats, systemLocked } = get();
-    if (systemLocked) return;
-
+  claimProgramRewards: async (programId) => {
+    const { programs, stats, session } = get();
     const program = programs.find(p => p.id === programId);
-    if (!program || program.isClaimed) return;
+    if (!program || program.isClaimed || !program.tasks.every(t => t.completed)) return;
 
-    const allDone = program.tasks.every(t => t.completed);
-    if (!allDone) return;
+    const updatedStats = { ...stats };
+    Object.entries(program.rewards.stats).forEach(([stat, val]) => updatedStats[stat as keyof UserStats] += val as number);
+    const resetTasks = program.tasks.map(t => ({ ...t, completed: false }));
 
-    get().playSound('sfx_quest_complete.mp3');
-    
-    let updatedStats = { ...stats };
-    Object.entries(program.rewards.stats).forEach(([stat, val]) => {
-      const key = stat as keyof UserStats;
-      updatedStats[key] += (val || 0);
-    });
-
-    await db.userStats.update(1, updatedStats);
+    if (session) {
+      await supabase.from('user_stats').update(updatedStats).eq('user_id', session.user.id);
+      await supabase.from('programs').update({ is_claimed: true, tasks: resetTasks }).match({ id: programId, user_id: session.user.id });
+    }
+    set(s => ({ stats: updatedStats, programs: s.programs.map(p => p.id === programId ? { ...p, isClaimed: true, tasks: resetTasks } : p) }));
     await get().addXp(program.rewards.xp);
-    
-    // Add Item
-    const itemRarity: any = program.rewards.item.includes('Key') ? 'RARE' : program.rewards.item.includes('Chronos') ? 'EPIC' : 'UNCOMMON';
-    await get().addItem({
-        id: `item_${program.rewards.item.toLowerCase().replace(/ /g, '_')}`,
-        name: program.rewards.item,
-        rarity: itemRarity,
-        description: `A powerful reward from completing ${program.title}.`,
-        isConsumable: true
-    }, 1);
-
-    const updatedProgram = { ...program, isClaimed: true };
-    await db.programs.put(updatedProgram);
-    
-    // Reset tasks for the program as per blueprint
-    const resetProgram = {
-        ...updatedProgram,
-        tasks: updatedProgram.tasks.map(t => ({ ...t, completed: false })),
-        isClaimed: false 
-    };
-    await db.programs.put(resetProgram);
-
-    set(state => ({
-        stats: updatedStats,
-        programs: state.programs.map(p => p.id === programId ? resetProgram : p)
-    }));
-
-    await get().addLog('ACHIEVEMENT', `Program Complete: ${program.title}. Major rewards claimed.`);
-    get().addToast({ 
-        type: 'SUCCESS', 
-        title: 'Campaign Completed', 
-        message: `${program.title} payload claimed.`,
-        stats: { ...program.rewards.stats, xp: program.rewards.xp }
-    });
+    get().addToast({ type: 'SUCCESS', title: 'Payload Claimed', message: program.title });
   },
 
-  setDifficulty: async (difficulty: QuestDifficulty) => {
-    if (get().globalDifficulty === difficulty) return;
-
-    get().playSound('sfx_warning_alert.mp3');
-    
-    // Penalty: Flush active quests
-    await db.quests.clear();
+  setDifficulty: async (difficulty) => {
+    const { session } = get();
     set({ globalDifficulty: difficulty, quests: [] });
-    
-    await get().addLog('PENALTY', `System difficulty re-scaled to ${difficulty}. Active instances terminated.`);
-    get().addToast({ type: 'WARNING', title: 'System Calibrated', message: `Difficulty adjusted to ${difficulty}.` });
+    if (session) await supabase.from('quests').delete().eq('user_id', session.user.id);
+    else await db.quests.clear();
     await get().seedDailyQuest();
-    await get().fetchSystemDirective();
+    get().addToast({ type: 'INFO', title: 'System Calibrated', message: difficulty });
   },
 
-  setTrainingFocus: (focus: 'BALANCED' | 'STRENGTH' | 'AGILITY' | 'VITALITY') => {
-    get().playSound('sfx_ui_click.mp3');
-    set({ trainingFocus: focus });
-    get().addLog('SYSTEM_EVENT', `Training focus shifted to: ${focus}`);
-    get().addToast({ type: 'INFO', title: 'Focus Shifted', message: `Primary matrix set to ${focus}.` });
-  },
-
-  updateSettings: (newSettings: Partial<SystemSettings>) => {
-    const updatedSettings = { ...get().settings, ...newSettings };
-    set({ settings: updatedSettings });
-    localStorage.setItem('arise_settings', JSON.stringify(updatedSettings));
-    get().playSound('sfx_ui_click.mp3');
-    get().addToast({ type: 'INFO', title: 'System Configuration', message: 'Internal settings updated.' });
-  },
+  setTrainingFocus: (focus) => { set({ trainingFocus: focus }); get().addToast({ type: 'INFO', title: 'Focus Set', message: focus }); },
+  updateSettings: (s) => set(state => ({ settings: { ...state.settings, ...s } })),
 
   rebirth: async () => {
-    get().playSound('sfx_rebirth_sequence.mp3');
-    
-    // Wipe everything except logs
-    await db.userProfile.put({ ...INITIAL_PROFILE, id: 1 });
-    await db.userStats.put({ ...INITIAL_STATS, id: 1 });
-    await db.quests.clear();
-    await db.inventory.clear();
-    await db.wellnessTasks.clear();
-    await db.wellnessTasks.bulkPut(DEFAULT_WELLNESS_TASKS);
-    await db.programs.clear();
-
-    const profile = INITIAL_PROFILE;
-    const stats = INITIAL_STATS;
-    const wellnessTasks = await db.wellnessTasks.toArray();
-    
-    set({ 
-        profile, 
-        stats, 
-        quests: [], 
-        inventory: [], 
-        wellnessTasks,
-        programs: [],
-        isPenaltyActive: false,
-        globalDifficulty: 'MEDIUM',
-        trainingFocus: 'BALANCED'
-    });
-
-    await get().addLog('ACHIEVEMENT', 'REBIRTH SEQUENCE COMPLETE. Physical matrix returned to baseline.');
-    get().addToast({ type: 'SUCCESS', title: 'System Rebirth', message: 'Physical matrix returned to baseline.' });
-    await get().fetchSystemDirective();
+    const { session } = get();
+    if (session) {
+      await supabase.from('profiles').update({ level: 1, xp: 0, rank: 'E-Rank', title: 'Newbie Hunter', attribute_points: 0 }).eq('id', session.user.id);
+      await supabase.from('user_stats').update(INITIAL_STATS).eq('user_id', session.user.id);
+      await supabase.from('quests').delete().eq('user_id', session.user.id);
+      await supabase.from('inventory').delete().eq('user_id', session.user.id);
+    }
+    set({ profile: INITIAL_PROFILE, stats: INITIAL_STATS, quests: [], inventory: [], wellnessTasks: [], programs: [] });
+    get().addToast({ type: 'SUCCESS', title: 'Rebirth Sequence', message: 'Matrix baseline restored.' });
   }
 }));

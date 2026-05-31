@@ -1,10 +1,10 @@
 import { useSystemStore } from '../store/useSystemStore';
-import { Volume2, VolumeX, Smartphone, EyeOff, Eye, RefreshCw, Trash2 } from 'lucide-react';
+import { Volume2, VolumeX, Smartphone, EyeOff, Eye, RefreshCw, Trash2, LogOut, ShieldCheck } from 'lucide-react';
 import { useState } from 'react';
 import { ConfirmationModal } from './ConfirmationModal';
 
 export const Settings = () => {
-  const { settings, updateSettings, rebirth } = useSystemStore();
+  const { settings, updateSettings, rebirth, signOut, session } = useSystemStore();
   const [showRebirthModal, setShowRebirthModal] = useState(false);
 
   const handleToggle = (key: keyof typeof settings) => {
@@ -78,6 +78,31 @@ export const Settings = () => {
           </button>
         </div>
       </section>
+
+      {/* Account Matrix */}
+      {session && (
+        <section className="space-y-4 pt-10 border-t border-white/5">
+          <h3 className="text-xs font-black text-gray-400 uppercase tracking-widest mb-4">Account Matrix</h3>
+          <div className="glass-panel p-6 flex items-center justify-between bg-white/5 border border-white/10">
+            <div className="flex items-center space-x-4">
+              <div className="w-12 h-12 rounded-full bg-ethereal-blue/10 border border-ethereal-blue/30 flex items-center justify-center">
+                <ShieldCheck size={24} className="text-ethereal-blue" />
+              </div>
+              <div>
+                <p className="text-xs font-black text-white uppercase tracking-widest">{session.user.email}</p>
+                <p className="text-[9px] text-gray-500 font-mono uppercase mt-1 tracking-tighter">Cloud Synchronization: [Active]</p>
+              </div>
+            </div>
+            <button 
+              onClick={signOut}
+              className="flex items-center space-x-2 px-4 py-2 rounded-lg bg-monolith border border-white/10 text-gray-400 hover:text-ethereal-blue hover:border-ethereal-blue/50 transition-all font-orbitron text-[9px] font-black tracking-widest uppercase"
+            >
+              <LogOut size={14} />
+              <span>Terminate Session</span>
+            </button>
+          </div>
+        </section>
+      )}
 
       {/* Danger Zone */}
       <section className="space-y-4 pt-10 border-t border-white/5">
