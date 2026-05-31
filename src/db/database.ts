@@ -1,5 +1,5 @@
 import Dexie, { type Table } from 'dexie';
-import type { UserProfile, UserStats, Quest, WellnessTask } from '../types';
+import type { UserProfile, UserStats, Quest, WellnessTask, Program } from '../types';
 import type { InventoryItem, SystemLog } from '../types/features';
 
 export class AriseDatabase extends Dexie {
@@ -9,16 +9,18 @@ export class AriseDatabase extends Dexie {
   inventory!: Table<InventoryItem>;
   systemLogs!: Table<SystemLog>;
   wellnessTasks!: Table<WellnessTask>;
+  programs!: Table<Program>;
 
   constructor() {
     super('AriseSystemDB');
-    this.version(3).stores({
+    this.version(4).stores({
       userProfile: 'id',
       userStats: 'id',
       quests: 'id, type, rank, expiresAt',
       inventory: 'id, rarity',
       systemLogs: 'id, category, timestamp',
-      wellnessTasks: 'id, type'
+      wellnessTasks: 'id, type',
+      programs: 'id, category'
     });
   }
 }

@@ -30,3 +30,21 @@ export interface SystemLog {
     raw_sensor_summary?: string;
   };
 }
+
+export type ToastType = 'INFO' | 'SUCCESS' | 'WARNING' | 'ERROR' | 'LEVEL_UP';
+
+export interface SystemToast {
+  id: string;
+  type: ToastType;
+  title: string;
+  message: string;
+  stats?: Partial<{
+    strength: number;
+    agility: number;
+    vitality: number;
+    intelligence: number;
+    sense: number;
+    xp: number;
+    attributePoints: number;
+  }>;
+}
